@@ -25,7 +25,18 @@ REDIRECT_URI = "http://localhost/callback"
 
 
 def prompt(msg: str, default: str = "", secret: bool = False) -> str:
+    """Prompt the user until a non-empty value (or a default) is given.
+
+    Args:
+        msg: The label shown before the input field.
+        default: Returned if the user submits an empty line; shown in brackets.
+        secret: When True, hide typed characters (used for the client secret).
+
+    Returns:
+        The entered value, or the default when input is left blank.
+    """
     suffix = f" [{default}]" if default else ""
+    # Loop so a blank answer with no default re-asks instead of returning "".
     while True:
         val = getpass(f"{msg}{suffix}: ") if secret else input(f"{msg}{suffix}: ").strip()
         if val:
@@ -35,6 +46,16 @@ def prompt(msg: str, default: str = "", secret: bool = False) -> str:
 
 
 def generate_authorize_url(subdomain: str, client_id: str) -> str:
+    """Build the Zendesk OAuth authorize URL the user opens in a browser.
+
+    Args:
+        subdomain: The Zendesk account subdomain (e.g. "acme").
+        client_id: The OAuth client identifier of the registered app.
+
+    Returns:
+        A tuple of (authorize_url, redirect_uri). The redirect_uri is returned
+        too so the caller can reuse the exact value during code exchange.
+    """
     return (
         f"https://{subdomain}.zendesk.com/oauth/authorizations/new"
         f"?response_type=code"
@@ -45,6 +66,20 @@ def generate_authorize_url(subdomain: str, client_id: str) -> str:
 
 
 def extract_code_from_url(url: str) -> str:
+    """Pull the ``code`` query parameter out of the pasted redirect URL.
+
+    After authorizing, Zendesk redirects to ``REDIRECT_URI?code=...``; the page
+    fails to load but the address bar still holds the authorization code.
+
+    Args:
+        url: The full redirect URL the user copied from the browser.
+
+    Returns:
+        The OAuth authorization code.
+
+    Raises:
+        ValueError: If the URL has no ``code`` parameter.
+    """
     params = parse_qs(urlparse(url).query)
     code = params.get("code", [None])[0]
     if not code:
@@ -54,6 +89,19 @@ def extract_code_from_url(url: str) -> str:
 
 def exchange_code(subdomain: str, client_id: str, client_secret: str,
                   code: str, redirect_uri: str) -> dict:
+    """Trade the one-time authorization code for OAuth tokens.
+
+    Args:
+        subdomain: The Zendesk account subdomain.
+        client_id: The OAuth client identifier.
+        client_secret: The OAuth client secret.
+        code: The authorization code from ``extract_code_from_url``.
+        redirect_uri: The same redirect URI used to request the code.
+
+    Returns:
+        The token response dict (access_token, refresh_token, etc.).
+        Exits the process if Zendesk returns a non-OK status.
+    """
     resp = requests.post(
         f"https://{subdomain}.zendesk.com/oauth/tokens",
         json={
@@ -73,6 +121,18 @@ def exchange_code(subdomain: str, client_id: str, client_secret: str,
 
 
 def test_connection(subdomain: str, access_token: str) -> dict:
+    """Verify the access token by calling the /users/me endpoint.
+
+    Confirms the token is valid and has access before we save anything.
+
+    Args:
+        subdomain: The Zendesk account subdomain.
+        access_token: The freshly obtained OAuth access token.
+
+    Returns:
+        A dict with the authenticated user's name, email, and role.
+        Exits the process on 401 (invalid token), 403 (denied), or other errors.
+    """
     headers = {"Authorization": f"Bearer {access_token}"}
     resp = requests.get(
         f"https://{subdomain}.zendesk.com/api/v2/users/me.json",
@@ -92,6 +152,18 @@ def test_connection(subdomain: str, access_token: str) -> dict:
 
 
 def fetch_org_fields(subdomain: str, access_token: str) -> list[dict]:
+    """Fetch the account's organization field definitions.
+
+    These are the custom fields the user later maps CSV columns onto.
+
+    Args:
+        subdomain: The Zendesk account subdomain.
+        access_token: A valid OAuth access token.
+
+    Returns:
+        A list of organization field dicts (each with key/title/type).
+        Exits the process if the request fails.
+    """
     headers = {"Authorization": f"Bearer {access_token}"}
     resp = requests.get(
         f"https://{subdomain}.zendesk.com/api/v2/organization_fields.json",
@@ -104,10 +176,17 @@ def fetch_org_fields(subdomain: str, access_token: str) -> list[dict]:
 
 
 def main():
+    """Run the interactive OAuth setup wizard and write config.json.
+
+    Guides the user through entering app credentials, completing the browser
+    authorization flow, exchanging the code for tokens, verifying the
+    connection, and mapping CSV columns to organization field keys.
+    """
     print("=" * 55)
     print("  Zendesk Org Field Updater — OAuth Setup")
     print("=" * 55)
 
+    # Confirm before clobbering an existing configuration.
     if CONFIG_PATH.exists():
         overwrite = input(f"\nConfig exists at {CONFIG_PATH}. Overwrite? [y/N]: ").strip().lower()
         if overwrite != "y":
@@ -176,6 +255,7 @@ def main():
     print("\n--- Map CSV Columns to Organization Fields ---")
     print("For each CSV column below, enter the matching field KEY.\n")
 
+    # Ask the user which org field key each known CSV column should write to.
     field_map = {}
     available = {f["key"]: f["title"] for f in org_fields}
 
@@ -183,6 +263,7 @@ def main():
         if available:
             print(f"  Available keys: {', '.join(available.keys())}")
         key = prompt(f"  Field key for '{csv_col}'", default="")
+        # Warn but still accept unknown keys, in case the field is created later.
         if key not in available:
             print(f"  WARNING: '{key}' not in fetched org fields — will be used as-is.")
         field_map[csv_col] = key

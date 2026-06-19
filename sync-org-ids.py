@@ -20,6 +20,12 @@ CONFIG_PATH = Path(__file__).parent / "config.json"
 
 
 def load_config() -> dict:
+    """Load config.json written by setup.py.
+
+    Returns:
+        The parsed config dict (subdomain, access_token, etc.).
+        Exits the process if the config file does not exist.
+    """
     if not CONFIG_PATH.exists():
         print(f"Config not found at {CONFIG_PATH}")
         print("Run setup.py first.")
@@ -28,9 +34,20 @@ def load_config() -> dict:
 
 
 def fetch_all_orgs(subdomain: str, access_token: str) -> list[dict]:
+    """Fetch every organization in the account, following pagination.
+
+    Args:
+        subdomain: The Zendesk account subdomain.
+        access_token: A valid OAuth access token.
+
+    Returns:
+        A flat list of organization dicts across all pages.
+        Exits the process on an expired token (401) or any other API error.
+    """
     orgs = []
     url = f"https://{subdomain}.zendesk.com/api/v2/organizations.json?per_page=100"
     headers = {"Authorization": f"Bearer {access_token}"}
+    # Keep requesting the next page until Zendesk stops returning one.
     while url:
         resp = requests.get(url, headers=headers, timeout=30)
         if resp.status_code == 401:
@@ -41,11 +58,18 @@ def fetch_all_orgs(subdomain: str, access_token: str) -> list[dict]:
             sys.exit(1)
         data = resp.json()
         orgs.extend(data.get("organizations", []))
+        # "next_page" is offset-style; "links.next" is cursor-style — accept either.
         url = data.get("next_page") or (data.get("links") or {}).get("next")
     return orgs
 
 
 def main():
+    """Entry point: rewrite the CSV's organization_id column with live IDs.
+
+    Fetches all orgs from Zendesk, matches each CSV row to an org by name
+    (case-insensitive), overwrites organization_id with the live value, and
+    writes the CSV back in place. Rows with no name are left untouched.
+    """
     if len(sys.argv) < 2:
         print(__doc__.strip())
         sys.exit(1)
@@ -70,6 +94,7 @@ def main():
         if name:
             name_to_id[name] = o["id"]
 
+    # Read all rows up front; we rewrite the whole file at the end.
     with open(csv_path, newline="", encoding="utf-8-sig") as f:
         reader = csv.DictReader(f)
         rows = list(reader)
@@ -88,11 +113,13 @@ def main():
         old_id = row.get("organization_id", "").strip()
         name = (row.get("name") or "").strip()
 
+        # Without a name there is nothing to match on; keep the row as-is.
         if not name:
             skipped += 1
             updates.append(row)
             continue
 
+        # Match by lowercased name; overwrite the ID and log any actual change.
         live_id = name_to_id.get(name.lower())
         if live_id:
             row["organization_id"] = str(live_id)

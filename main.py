@@ -35,6 +35,16 @@ def log(msg: str):
 
 
 def load_config() -> dict:
+    """Load and validate config.json.
+
+    Reads the OAuth credentials and CSV-to-field mapping written by setup.py.
+    Exits the process with a clear message if the file is missing, corrupted,
+    or missing any required key — callers can assume a valid config on return.
+
+    Returns:
+        The parsed config dict (subdomain, tokens, client creds, field_mapping).
+    """
+    # Read and parse the JSON config; bail out early on any I/O or format error.
     try:
         raw = CONFIG_PATH.read_text(encoding="utf-8")
         cfg = json.loads(raw)
@@ -45,11 +55,13 @@ def load_config() -> dict:
         log(f"Config file is corrupted (invalid JSON): {e}")
         sys.exit(1)
 
+    # Every key below is required for the update run; report all missing at once.
     required = ["subdomain", "access_token", "refresh_token", "client_id", "client_secret", "field_mapping"]
     missing = [k for k in required if k not in cfg]
     if missing:
         log(f"Config missing required keys: {', '.join(missing)}. Re-run setup.py.")
         sys.exit(1)
+    # field_mapping must be a non-empty dict, otherwise there is nothing to sync.
     if not isinstance(cfg["field_mapping"], dict) or not cfg["field_mapping"]:
         log(f"field_mapping in config is empty. Re-run setup.py to map CSV columns.")
         sys.exit(1)
@@ -69,6 +81,18 @@ def safe_json(resp: requests.Response) -> dict:
 
 
 def refresh_token(config: dict) -> str | None:
+    """Exchange the stored refresh token for a fresh access token.
+
+    On success the new access token (and any rotated refresh token) is written
+    back into ``config`` and persisted to config.json so future runs reuse it.
+
+    Args:
+        config: The live config dict; mutated in place with the new token(s).
+
+    Returns:
+        The new access token, or None if the refresh failed (network error,
+        non-OK response, or unparseable body).
+    """
     try:
         resp = requests.post(
             f"https://{config['subdomain']}.zendesk.com/oauth/tokens",
@@ -85,8 +109,11 @@ def refresh_token(config: dict) -> str | None:
         new_access = data.get("access_token")
         if new_access:
             config["access_token"] = new_access
+            # Zendesk may rotate the refresh token too; keep the newest one.
             if data.get("refresh_token"):
                 config["refresh_token"] = data["refresh_token"]
+            # Persist so the next run starts already authenticated. A write
+            # failure is non-fatal — the in-memory token still works this run.
             try:
                 CONFIG_PATH.write_text(json.dumps(config, indent=2))
             except OSError as e:
@@ -106,10 +133,13 @@ def api_get(config: dict, path: str) -> tuple:
     headers = {"Authorization": f"Bearer {token}"}
     url = f"https://{config['subdomain']}.zendesk.com/api/v2/{path}"
 
+    # Two attempts: the first may fail transiently or with an expired token;
+    # the second runs after a network retry or a token refresh.
     for attempt in range(2):
         try:
             resp = requests.get(url, headers=headers, timeout=30)
         except (ConnectionError, Timeout) as e:
+            # Retry once on transient network errors, then give up.
             if attempt == 0:
                 log(f"  Network error on GET {path}, retrying: {e}")
                 continue
@@ -118,6 +148,8 @@ def api_get(config: dict, path: str) -> tuple:
             log(f"  Request failed on GET {path}: {e}")
             return 0, {}
 
+        # 401 on the first try usually means the access token expired; refresh
+        # it and loop once more with the new bearer token.
         if resp.status_code == 401 and attempt == 0:
             new_token = refresh_token(config)
             if new_token:
@@ -156,9 +188,12 @@ def fetch_all_org_fields(config: dict) -> dict:
             if oid:
                 result[oid] = org.get("organization_fields") or {}
 
+        # Follow Zendesk pagination. Offset-based responses use "next_page";
+        # cursor-based ones nest it under "links". An empty url ends the loop.
         next_url = data.get("next_page") or (data.get("links") or {}).get("next")
         url = ""
         if next_url and isinstance(next_url, str):
+            # api_get() expects a path relative to /api/v2/, so strip the host.
             prefix = f"https://{config['subdomain']}.zendesk.com/api/v2/"
             if next_url.startswith(prefix):
                 url = next_url[len(prefix):]
@@ -218,7 +253,19 @@ def validate_csv(rows: list, field_mapping: dict) -> bool:
 
 
 def main():
+    """Entry point: read the CSV, diff against Zendesk, and push updates.
+
+    Steps:
+      1. Parse CLI args (csv path, optional --dry-run / --force).
+      2. Load config and the CSV rows.
+      3. Fetch every org's current fields once, up front.
+      4. For each row, compute the fields that actually need changing
+         (skipping ones already set unless --force).
+      5. Send the changes in batches via organizations/update_many.json,
+         polling the async job status when Zendesk queues the work.
+    """
     try:
+        # Require a CSV path; with no args, print the module usage and exit.
         if len(sys.argv) < 2:
             print(__doc__.strip())
             sys.exit(1)
@@ -228,6 +275,7 @@ def main():
             log(f"File not found: {csv_path}")
             sys.exit(1)
 
+        # Flags: --dry-run previews without writing; --force overwrites existing values.
         dry_run = "--dry-run" in sys.argv
         force = "--force" in sys.argv
 
@@ -260,8 +308,10 @@ def main():
         not_found = 0
         row_errors = 0
 
+        # Build the list of update payloads, one per org that needs changes.
         for row in rows:
             try:
+                # organization_id is mandatory and must be numeric.
                 oid_str = (row.get("organization_id") or "").strip()
                 if not oid_str:
                     skipped += 1
@@ -272,11 +322,13 @@ def main():
                     continue
                 oid = int(oid_str)
 
+                # The org must exist in the data we fetched, or we cannot update it.
                 if oid not in all_fields:
                     log(f"  {row.get('name', '?')}: org {oid} NOT FOUND")
                     not_found += 1
                     continue
 
+                # Translate mapped CSV columns into Zendesk field keys, ignoring blanks.
                 existing = all_fields[oid]
                 desired = {}
                 for csv_col, fk in field_mapping.items():
@@ -284,18 +336,22 @@ def main():
                     if val:
                         desired[fk] = val
 
+                # Without --force, drop any field that already has a non-empty value
+                # so we never clobber data that is already present in Zendesk.
                 if not force and existing:
                     for key in list(desired.keys()):
                         cur = existing.get(key)
                         if cur is not None and cur != "":
                             del desired[key]
 
+                # If nothing remains to write, this row is already up to date.
                 if not desired:
                     skipped += 1
                     continue
 
                 updates.append({"id": oid, "organization_fields": desired})
             except Exception as e:
+                # Never let one malformed row abort the whole run.
                 log(f"  Error processing row: {e}")
                 row_errors += 1
 
@@ -311,6 +367,7 @@ def main():
                 log(f"  Org {u['id']}: {u['organization_fields']}")
             return
 
+        # Zendesk's update_many accepts at most BATCH_SIZE orgs per call.
         total_batches = (len(updates) - 1) // BATCH_SIZE + 1
 
         for batch_start in range(0, len(updates), BATCH_SIZE):
@@ -335,6 +392,7 @@ def main():
                 log(f"  Request failed: {e}")
                 continue
 
+            # Token may have expired mid-run; refresh and resend this batch once.
             if resp.status_code == 401:
                 new_token = refresh_token(config)
                 if new_token:
@@ -351,6 +409,8 @@ def main():
                         log(f"  Retry failed: {e}")
                         continue
 
+            # 200 = applied immediately; 202 = queued as an async job we must poll;
+            # 422 = validation rejection; anything else is an unexpected failure.
             if resp.status_code == 200:
                 log("  Completed synchronously.")
             elif resp.status_code == 202:
@@ -369,6 +429,7 @@ def main():
             else:
                 log(f"  HTTP {resp.status_code}: {resp.text[:200]}")
 
+            # Be polite to the API between batches to avoid rate limiting.
             time.sleep(1)
 
         log(f"All done. {len(updates)} updated, {skipped} complete, {not_found} not found.")
